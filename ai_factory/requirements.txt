@@ -1,0 +1,16 @@
+# Core AI & Math
+numpy>=1.23.5
+opencv-python-headless>=4.8.0
+tqdm>=4.66.0
+pyyaml>=6.0.1
+requests>=2.31.0
+pillow>=10.0.0
+
+# Data Downloading
+roboflow>=1.1.0
+kaggle>=1.5.16
+gdown>=4.7.1
+
+# YOLO Training
+ultralytics>=8.1.0
+

@@ -1,0 +1,33 @@
+description: Ultralytics best model trained on datasets/processed/data.yaml
+author: Ultralytics
+date: '2025-12-16T21:01:57.944410'
+version: 8.3.239
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: bB
+  1: bK
+  2: bN
+  3: bP
+  4: bQ
+  5: bR
+  6: wB
+  7: wK
+  8: wN
+  9: wP
+  10: wQ
+  11: wR
+  12: corner
+args:
+  batch: 1
+  fraction: 1.0
+  half: true
+  int8: false
+  nms: false
+channels: 3
