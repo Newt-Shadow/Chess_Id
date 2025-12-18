@@ -10,6 +10,8 @@ from sklearn.neighbors import KNeighborsClassifier
 import chess
 from collections import deque, Counter
 from PIL import Image, ImageDraw
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # ================= CONFIG =================
 ROOT = Path(__file__).resolve().parent
@@ -21,17 +23,19 @@ MODEL_PATH = ROOT / "chess_grandmaster/round2_finetune/weights/best.pt"
 BOARD_PIXELS = 640
 SQUARE_SIZE = BOARD_PIXELS // 8
 
-# TUNING
+# ADAPTIVE TUNING
 CONF_THRESHOLD = 0.35     
 CHANGE_THRESHOLD = 1500   
 MOTION_THRESHOLD = 15000  
-HISTORY_LEN = 10          
-STABILITY_THRESHOLD = 7   
+HISTORY_LEN = 8           
+STABILITY_THRESHOLD = 6   
 
-# >>> HAND LOGIC <<<
-PIXEL_DIFF_THRESH = 30    
-CHANGED_PIXELS_MIN = 50   
-MAX_HAND_SQUARES = 6      # If >6 squares change, it's a hand. Pause.
+# >>> PER-SQUARE ADAPTIVE LOGIC <<<
+EDGE_CHANGE_THRESHOLD = 100 # Lowered to catch faint black pieces
+PIXEL_DIFF_THRESH = 25      # More sensitive to dark-on-dark changes
+CHANGED_PIXELS_MIN = 40     
+MAX_HAND_SQUARES = 10     
+STUCK_TIMEOUT = 40        
 
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -79,7 +83,7 @@ def get_corners_via_web(frame):
     done.wait()
     return np.array([(p["x"], p["y"]) for p in pts], dtype=np.float32)
 
-# ================= GEOMETRY =================
+# ================= GEOMETRY & MAPPING =================
 
 def warp_board(frame, corners):
     dst = np.array([
@@ -131,7 +135,19 @@ class BoardClassifier:
         if not self.trained: return False
         return self.knn.predict([self.extract(roi)])[0] == 1
 
-# ================= VISION LOGIC =================
+# ================= ADAPTIVE VISION LOGIC =================
+
+def get_adaptive_edges(roi):
+    """
+    Computes Canny edges dynamically for a SINGLE SQUARE.
+    This fixes the issue where dark squares were ignored.
+    """
+    v = np.median(roi)
+    # Tighter thresholds for dark squares to catch faint lines
+    sigma = 0.33
+    lower = int(max(0, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+    return cv2.Canny(roi, lower, upper)
 
 def get_background_vision(model, frame, last_valid, board, classifier):
     # 1. YOLO
@@ -148,37 +164,108 @@ def get_background_vision(model, frame, last_valid, board, classifier):
         if classifier.predict(get_square_roi(frame, sq)):
             class_occ.add(sq)
             
-    # 3. Change Detection (PIXEL COUNT)
+    # 3. Change Detection (INDEPENDENT SQUARE TRACKING)
     gray_curr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray_last = cv2.cvtColor(last_valid, cv2.COLOR_BGR2GRAY)
     
     final_occ = set()
     changed_squares = set()
     
+    # Visualization canvas for edges
+    full_edge_debug = np.zeros_like(gray_curr)
+    
     for sq in chess.SQUARES:
-        r1 = get_square_roi(gray_curr, sq)
-        r2 = get_square_roi(gray_last, sq)
-        diff = cv2.absdiff(r1, r2)
-        _, thresh = cv2.threshold(diff, PIXEL_DIFF_THRESH, 255, cv2.THRESH_BINARY)
+        # Get ROIs
+        r_curr = get_square_roi(gray_curr, sq)
+        r_last = get_square_roi(gray_last, sq)
         
-        if cv2.countNonZero(thresh) > CHANGED_PIXELS_MIN:
+        # A. Pixel Change (Adaptive Thresholding per square)
+        diff = cv2.absdiff(r_curr, r_last)
+        _, thresh = cv2.threshold(diff, PIXEL_DIFF_THRESH, 255, cv2.THRESH_BINARY)
+        has_pixel_change = cv2.countNonZero(thresh) > CHANGED_PIXELS_MIN
+        
+        # B. Edge Change (Adaptive per square)
+        e_curr = get_adaptive_edges(r_curr)
+        e_last = get_adaptive_edges(r_last)
+        e_diff = cv2.absdiff(e_curr, e_last)
+        has_edge_change = cv2.countNonZero(e_diff) > EDGE_CHANGE_THRESHOLD
+        
+        # Paste edge diff into debug view
+        y, x = (chess.square_rank(sq)*SQUARE_SIZE, chess.square_file(sq)*SQUARE_SIZE)
+        gap = int(SQUARE_SIZE * 0.25)
+        # Handle slice boundaries safely
+        try:
+            full_edge_debug[y+gap:y+SQUARE_SIZE-gap, x+gap:x+SQUARE_SIZE-gap] = e_diff
+        except: pass
+
+        # COMBINED LOGIC
+        if has_pixel_change or has_edge_change:
             changed_squares.add(sq)
-            # Visual Change -> Trust Vision
             if (sq in yolo_occ) or (sq in class_occ):
                 final_occ.add(sq)
         else:
-            # No Change -> Trust Logic
             if board.piece_at(sq):
                 final_occ.add(sq)
                 
-    return final_occ, changed_squares
+    return final_occ, changed_squares, full_edge_debug
+
+def heal_background(last_valid, current_frame, sq):
+    rank = chess.square_rank(sq)
+    file = chess.square_file(sq)
+    x = rank * SQUARE_SIZE
+    y = file * SQUARE_SIZE
+    last_valid[y:y+SQUARE_SIZE, x:x+SQUARE_SIZE] = current_frame[y:y+SQUARE_SIZE, x:x+SQUARE_SIZE]
+    return last_valid
+
+# ================= HISTOGRAM VISUALIZER (FIXED) =================
+
+def draw_histogram_window(frame, changed_squares):
+    """
+    Creates a visual histogram for up to 4 'Changed' squares.
+    """
+    if not changed_squares:
+        blank = np.zeros((300, 400, 3), dtype=np.uint8)
+        cv2.putText(blank, "No Active Changes", (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1)
+        return blank
+
+    fig, axes = plt.subplots(1, min(4, len(changed_squares)), figsize=(5, 3), dpi=80)
+    if len(changed_squares) == 1: axes = [axes]
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    active_list = list(changed_squares)[:4]
+    
+    for i, sq in enumerate(active_list):
+        roi = get_square_roi(gray, sq)
+        hist = cv2.calcHist([roi], [0], None, [256], [0, 256])
+        
+        ax = axes[i]
+        ax.plot(hist, color='white')
+        ax.set_title(chess.square_name(sq), fontsize=10, color='blue')
+        ax.axis('off')
+        # Set dark background for plot
+        ax.set_facecolor('black')
+        
+    fig.patch.set_facecolor('black')
+    plt.tight_layout()
+    
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    
+    # FIX: Use buffer_rgba() instead of tostring_rgb()
+    buf = canvas.buffer_rgba()
+    img = np.asarray(buf)
+    
+    # Convert RGBA -> BGR for OpenCV
+    img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    
+    plt.close(fig)
+    return img
 
 # ================= BEST FIT MOVE SOLVER =================
 
 def find_best_matching_move(board, visual_occupancy):
     best_move = None
     min_error = float('inf')
-    
     current_logic_occ = {sq for sq in chess.SQUARES if board.piece_at(sq)}
     current_error = len(current_logic_occ.symmetric_difference(visual_occupancy))
     diff_squares = current_logic_occ.symmetric_difference(visual_occupancy)
@@ -187,11 +274,9 @@ def find_best_matching_move(board, visual_occupancy):
         if len(diff_squares) > 0:
             if move.from_square not in diff_squares and move.to_square not in diff_squares:
                 continue
-
         board.push(move)
         pred_occ = {sq for sq in chess.SQUARES if board.piece_at(sq)}
         error = len(pred_occ.symmetric_difference(visual_occupancy))
-        
         if error < min_error:
             min_error = error
             best_move = move
@@ -200,7 +285,6 @@ def find_best_matching_move(board, visual_occupancy):
     if best_move:
         if min_error < current_error: return best_move
         elif min_error == current_error and min_error <= 1: return best_move
-            
     return None
 
 def check_hand_motion(curr, prev):
@@ -221,17 +305,9 @@ def draw_hud(image, board, changed_squares):
             x, y = c * SQUARE_SIZE, r * SQUARE_SIZE
             cx, cy = int(x + SQUARE_SIZE/2), int(y + SQUARE_SIZE/2)
             
-            # Highlight Blue Changes
-            color = (0,255,255)
-            if sq in changed_squares:
-                cv2.rectangle(overlay, (x, y), (x+SQUARE_SIZE, y+SQUARE_SIZE), (255,0,0), 2) # Blue
-                color = (255,0,0) 
-            else:
-                cv2.rectangle(overlay, (x, y), (x+SQUARE_SIZE, y+SQUARE_SIZE), (0,255,255), 1) # Yellow
-                
-            cv2.putText(overlay, chess.square_name(sq).upper(), (x+5, y+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            color = (255,0,0) if sq in changed_squares else (0,255,255)
+            cv2.rectangle(overlay, (x, y), (x+SQUARE_SIZE, y+SQUARE_SIZE), color, 1)
             
-            # Logic State
             if board.piece_at(sq):
                 cv2.circle(overlay, (cx, cy), 8, (0, 255, 0), -1)
             else:
@@ -282,6 +358,16 @@ def process_video():
     draw_virtual_board(board).save(out0/"virtual.png")
     
     hand_timer = 0
+    square_stuck_counters = np.zeros(64, dtype=int)
+    
+    # AUTO CALIBRATION
+    print("⚖️ Calibrating Vision...")
+    for _ in range(30):
+        ret, frame = cap.read()
+        warped = warp_board(frame, corners)
+        get_adaptive_edges(cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY))
+    print("✅ Calibration Complete.")
+    
     print("🎬 Processing...")
     
     while True:
@@ -304,26 +390,25 @@ def process_video():
             hand_timer = 0
         prev_frame = warped.copy()
         
-        # 2. Get Vision & Changes
-        visual_occ, changes = get_background_vision(model, warped, last_valid, board, classifier)
+        # 2. Vision & Changes
+        visual_occ, changes, edge_debug = get_background_vision(model, warped, last_valid, board, classifier)
         
-        # >>> HAND GATE <<<
-        # If too many squares changed (>6), assume Hand is present. Skip Logic.
+        # 3. Hand Gate
         if len(changes) > MAX_HAND_SQUARES:
             cv2.putText(warped, "HAND ON BOARD", (50, 300), cv2.FONT_HERSHEY_SIMPLEX, 2, (0,255,255), 4)
-            # Show the chaos so user knows why it's paused
             cv2.imshow("Chess AI", draw_hud(warped, board, changes))
             if cv2.waitKey(1) == 27: break
-            continue # SKIP EVERYTHING ELSE
+            continue 
             
-        # 3. Buffer (Only if Hand is gone)
+        # 4. Buffer
         occupancy_buffer.append(frozenset(visual_occ))
         
-        # 4. Vote
+        # 5. Vote
         most_common, agreement = Counter(occupancy_buffer).most_common(1)[0]
         stable_visual_occ = set(most_common)
         
-        # 5. Move Logic
+        # 6. Move Logic
+        move_found = False
         if agreement >= STABILITY_THRESHOLD:
             move = find_best_matching_move(board, stable_visual_occ)
             
@@ -334,6 +419,8 @@ def process_video():
                 
                 last_valid = warped.copy()
                 occupancy_buffer.clear()
+                square_stuck_counters.fill(0)
+                move_found = True
                 
                 out = OUT_DIR / f"move_{move_id:03d}"
                 out.mkdir(parents=True, exist_ok=True)
@@ -341,9 +428,26 @@ def process_video():
                 draw_virtual_board(board).save(out/"virtual.png")
                 (out/"fen.txt").write_text(board.fen())
         
-        # 6. Draw
+        # 7. Healing
+        if not move_found:
+            for sq in range(64):
+                if sq in changes:
+                    square_stuck_counters[sq] += 1
+                    if square_stuck_counters[sq] > STUCK_TIMEOUT:
+                        last_valid = heal_background(last_valid, warped, sq)
+                        square_stuck_counters[sq] = 0
+                else:
+                    square_stuck_counters[sq] = 0
+                    
+        # 8. Draw
         debug = draw_hud(warped, board, changes)
         cv2.imshow("Chess AI", debug)
+        cv2.imshow("Mask View", edge_debug)
+        
+        if len(changes) > 0:
+            hist_img = draw_histogram_window(warped, changes)
+            cv2.imshow("Pixel Histograms", hist_img)
+        
         if cv2.waitKey(1) == 27: break
 
     cap.release()
